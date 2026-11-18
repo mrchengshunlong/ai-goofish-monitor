@@ -47,6 +47,11 @@ from src.utils import (
 from src.rotation import RotationPool, load_state_files, parse_proxy_pool, RotationItem
 from src.failure_guard import FailureGuard
 from src.services.account_strategy_service import resolve_account_runtime_plan
+from src.services.session_state_persist import (
+    file_fingerprint,
+    persist_playwright_storage_state,
+    should_persist_session_state,
+)
 from src.infrastructure.persistence.storage_names import build_result_filename
 from src.services.item_analysis_dispatcher import (
     ItemAnalysisDispatcher,
@@ -609,6 +614,9 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 snapshot_data = json.load(f)
         except Exception as e:
             print(f"警告：读取登录状态文件失败，将直接按路径使用: {e}")
+        state_fingerprint = file_fingerprint(state_file)
+        confirmed_search_item_count = 0
+        attempt_error = None
 
         async with async_playwright() as p:
             launch_args = prepare_chromium_launch_args()
@@ -995,6 +1003,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     )
                     if not basic_items:
                         break
+                    confirmed_search_item_count += len(basic_items)
                     historical_snapshots.extend(
                         record_market_snapshots(
                             keyword=keyword,
@@ -1208,6 +1217,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 log_time("收到取消信号，正在终止当前爬虫任务...")
                 raise
             except Exception as e:
+                attempt_error = e
                 if type(e).__name__ == "TargetClosedError":
                     log_time("浏览器已关闭，忽略后续异常（可能是任务被停止）。")
                     return processed_item_count
@@ -1221,6 +1231,31 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 if analysis_dispatcher is not None:
                     log_time("等待后台分析任务完成...")
                     await analysis_dispatcher.join()
+                on_login_page = False
+                try:
+                    on_login_page = _is_login_url(page.url)
+                except Exception:
+                    on_login_page = False
+                cancelled = type(attempt_error).__name__ == "TargetClosedError"
+                persist_ok, persist_reason = should_persist_session_state(
+                    confirmed_search_item_count=confirmed_search_item_count,
+                    error=attempt_error,
+                    on_login_page=on_login_page,
+                    cancelled=cancelled,
+                )
+                if persist_ok:
+                    try:
+                        _saved, persist_reason = await persist_playwright_storage_state(
+                            context,
+                            state_file,
+                            existing_snapshot=snapshot_data,
+                            expected_fingerprint=state_fingerprint,
+                        )
+                    except Exception as persist_exc:
+                        persist_reason = (
+                            f"写回登录态失败，已保留原文件 ({type(persist_exc).__name__})"
+                        )
+                log_time(persist_reason)
                 log_time("任务执行完毕，浏览器将在5秒后自动关闭...")
                 await asyncio.sleep(5)
                 if debug_limit:

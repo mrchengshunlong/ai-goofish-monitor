@@ -123,3 +123,77 @@ def test_generate_request_requires_state_file_for_fixed_account_strategy():
         return
 
     raise AssertionError("固定账号模式应要求 account_state_file")
+
+
+def _bound_task(**overrides):
+    payload = dict(
+        id=1,
+        task_name="Sony A7M4",
+        enabled=True,
+        keyword="sony a7m4",
+        description="body",
+        max_pages=2,
+        personal_only=True,
+        min_price=None,
+        max_price=None,
+        cron=None,
+        ai_prompt_base_file="prompts/base_prompt.txt",
+        ai_prompt_criteria_file="prompts/sony_a7m4_criteria.txt",
+        account_state_file="state/acc_1.json",
+        account_strategy="fixed",
+        is_running=False,
+    )
+    payload.update(overrides)
+    return Task(**payload)
+
+
+def test_task_update_is_running_does_not_clear_account_binding():
+    task = _bound_task()
+    updated = task.apply_update(TaskUpdate(is_running=True))
+
+    assert updated.is_running is True
+    assert updated.account_state_file == "state/acc_1.json"
+    assert updated.account_strategy == "fixed"
+    assert TaskUpdate(is_running=True).model_dump(exclude_unset=True) == {"is_running": True}
+
+
+def test_task_update_explicit_account_clear_still_unbinds():
+    task = _bound_task()
+    updated = task.apply_update(TaskUpdate(account_state_file=None))
+
+    assert updated.account_state_file is None
+    assert updated.account_strategy == "auto"
+    assert updated.is_running is False
+
+
+def test_task_update_state_file_infers_fixed_strategy():
+    task = _bound_task(account_state_file=None, account_strategy="auto")
+    updated = task.apply_update(TaskUpdate(account_state_file="state/acc_2.json"))
+
+    assert updated.account_state_file == "state/acc_2.json"
+    assert updated.account_strategy == "fixed"
+
+
+def test_task_update_strategy_only_preserves_existing_file():
+    task = _bound_task()
+    updated = task.apply_update(TaskUpdate(account_strategy="rotate"))
+
+    assert updated.account_strategy == "rotate"
+    assert updated.account_state_file == "state/acc_1.json"
+
+
+def test_task_create_still_infers_fixed_strategy_from_state_file():
+    from src.domain.models.task import TaskCreate
+
+    created = TaskCreate(
+        task_name="Sony A7M4",
+        keyword="sony a7m4",
+        description="body",
+        max_pages=2,
+        personal_only=True,
+        ai_prompt_base_file="prompts/base_prompt.txt",
+        ai_prompt_criteria_file="prompts/sony_a7m4_criteria.txt",
+        account_state_file="state/acc_1.json",
+    )
+    assert created.account_strategy == "fixed"
+    assert created.account_state_file == "state/acc_1.json"
