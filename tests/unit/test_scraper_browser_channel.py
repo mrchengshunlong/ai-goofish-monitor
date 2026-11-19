@@ -27,13 +27,21 @@ def test_resolve_browser_channel_uses_msedge_locally_when_requested(monkeypatch)
     assert scraper._resolve_browser_channel() == "msedge"
 
 
-def test_chromium_launch_args_disable_crashpad_and_pin_dump_dir():
+def test_chromium_launch_args_are_safe_and_pin_dump_dir_only_in_docker():
     from src.scraper import build_chromium_launch_args
+    from src.services.browser_runtime import launch_args_are_safe
 
-    args = build_chromium_launch_args("/tmp/chromium-crashpad")
+    assert build_chromium_launch_args("/tmp/chromium-crashpad") == []
+    assert launch_args_are_safe(build_chromium_launch_args("/tmp/chromium-crashpad"))
 
+    args = build_chromium_launch_args("/tmp/chromium-crashpad", docker=True)
     assert "--disable-breakpad" in args
     assert "--disable-crash-reporter" in args
     assert "--crash-dumps-dir=/tmp/chromium-crashpad" in args
-    feature_flags = [arg for arg in args if arg.startswith("--disable-features=")]
-    assert feature_flags == ["--disable-features=IsolateOrigins,site-per-process,Crashpad"]
+    assert "--disable-features=Crashpad" in args
+    joined = " ".join(args)
+    assert "AutomationControlled" not in joined
+    assert "disable-web-security" not in joined
+    assert "IsolateOrigins" not in joined
+    assert "site-per-process" not in joined
+    assert launch_args_are_safe(args)

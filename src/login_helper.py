@@ -34,50 +34,37 @@ from src.services.login_auth_gate import (
 
 # file_fingerprint is in session_state_persist; I'll alias in gate or import here.
 from src.services.session_state_persist import file_fingerprint
-
-
-# Keep this identical to src.scraper scrape context init.
-SCRAPER_CONTEXT_INIT_SCRIPT = """
-                // 移除webdriver标识
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-
-                // 模拟真实移动设备的navigator属性
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en-US', 'en']});
-
-                // 添加chrome对象
-                window.chrome = {runtime: {}, loadTimes: function() {}, csi: function() {}};
-
-                // 模拟触摸支持
-                Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 5});
-
-                // 覆盖permissions查询（避免暴露自动化）
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({state: Notification.permission}) :
-                        originalQuery(parameters)
-                );
-            """
+from src.services.browser_runtime import (
+    AccountProfileLock,
+    ProfileBusyError,
+    UnsafeBrowserProfileError,
+    close_persistent_context,
+    ensure_account_profile_dir,
+    first_page,
+    launch_shared_persistent_context,
+)
 
 DEFAULT_TIMEOUT_SEC = 15 * 60
 PAGE_GOTO_TIMEOUT_MS = 60 * 1000
 
 USER_INSTRUCTIONS = """
 ================================ 闲鱼专用登录窗口 ================================
-将打开一个独立的闲鱼浏览器窗口（不会读取或附着你日常使用的 Chrome/Edge）。
+将使用本机已安装的桌面 Chrome，打开独立的闲鱼窗口。
+配置保存在项目目录 browser-profiles/<账号ID>，不会读取、复制或附着你日常使用的 Chrome/Edge。
 
 请在那个窗口里自行完成登录（可用闲鱼 App 扫码，或按页面提示做验证码）。
-不要在这个黑色控制台里输入账号、密码或验证码。
+不要在这个黑色控制台里输入账号、密码或验证码。本程序不会自动完成验证码。
 
-登录成功后，回到【这个控制台窗口】，按回车键保存登录态。
+登录成功后，回到【这个控制台窗口】，按回车键保存兼容快照。
 如果要放弃，输入 cancel 再回车。
 
 说明：
-- 登录态只保存在本机账号文件，不会发到别处。
-- 不能保证登录会一直有效；失效后可再运行本工具登录一次。
+- 兼容快照只保存在本机 state 账号文件，不会发到别处。
+- 取消或失败不会覆盖原 state 文件；但独立浏览器配置里由网站写入的本地状态会自动保留，取消并不能抹除这些变化。
+- 不能保证登录会一直有效；失效后可再运行本工具登录一次。第一次使用全新配置时，页面验证仍可能失败。
+- 同一账号的登录窗口和采集不能同时打开。
 - 请不要关闭刚刚打开的浏览器窗口，直到这里提示保存完成或已取消。
-- 最长等待约 15 分钟；超时会结束且不会覆盖原文件。
+- 最长等待约 15 分钟；超时会结束且不会覆盖原 state 文件。
 ================================================================================
 """.strip()
 
@@ -275,38 +262,49 @@ async def run_login_session(
         )
 
     if collection_tasks_are_running():
-        message = "有采集任务正在运行，已取消本次登录，以免同时写登录态"
+        message = "有采集任务正在运行，已取消本次登录，以免同时打开同一账号的浏览器配置"
         print(message)
         status_update(status="blocked_busy", message=message)
         return 2
 
     existing_snapshot = existing_snapshot_or_none(state_file)
     expected_fingerprint = file_fingerprint(str(state_file)) if state_file.is_file() else None
+    profile_lock = AccountProfileLock(root, account_id, purpose="login")
+    try:
+        profile_lock.acquire()
+    except ProfileBusyError as exc:
+        message = str(exc)
+        print(message)
+        status_update(status="blocked_busy", message=message)
+        return 2
+    except (UnsafeBrowserProfileError, ValueError) as exc:
+        message = str(exc)
+        print(message)
+        status_update(status="error", message=message)
+        return 2
+
     status_update(status="starting", message="正在打开独立登录窗口")
     print(USER_INSTRUCTIONS)
     print(f"将保存到本机账号文件: {relative_state}")
-    print("本次使用干净的独立浏览器配置，不会导入日常浏览器或旧的失效登录态。")
+    print("本次使用本机已安装的桌面 Chrome，以及项目内独立配置，不会导入日常浏览器或旧的 JSON 登录快照。")
     print("登录完成后请回到这里按回车保存；输入 cancel 取消。")
+    print("取消不会覆盖原 state 文件，但独立配置里由网站写入的本地状态会保留。")
 
     async def _default_browser_factory():
-        from src.scraper import (
-            _clean_kwargs,
-            _default_context_options,
-            _resolve_browser_channel,
-            prepare_chromium_launch_args,
-        )
+        from src.config import LOGIN_IS_EDGE, RUNNING_IN_DOCKER
         from playwright.async_api import async_playwright
 
         playwright = await async_playwright().start()
-        launch_kwargs = {
-            "headless": False,
-            "args": prepare_chromium_launch_args(),
-            "channel": _resolve_browser_channel(),
-        }
-        browser = await playwright.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(**_clean_kwargs(_default_context_options()))
-        await context.add_init_script(SCRAPER_CONTEXT_INIT_SCRIPT)
-        page = await context.new_page()
+        profile_dir = ensure_account_profile_dir(root, account_id)
+        context = await launch_shared_persistent_context(
+            playwright,
+            user_data_dir=profile_dir,
+            headless=False,
+            login_is_edge=LOGIN_IS_EDGE,
+            running_in_docker=RUNNING_IN_DOCKER,
+        )
+        browser = getattr(context, "browser", None)
+        page = await first_page(context)
         await page.goto(OFFICIAL_HOME_URL, wait_until="domcontentloaded", timeout=PAGE_GOTO_TIMEOUT_MS)
         return playwright, browser, context, page
 
@@ -320,11 +318,12 @@ async def run_login_session(
 
         async def _browser_still_open() -> bool:
             try:
-                if browser is None:
+                target = browser if browser is not None else context
+                if target is None:
                     return False
-                is_closed = getattr(browser, "is_connected", None)
-                if callable(is_closed):
-                    return bool(browser.is_connected())
+                is_connected = getattr(target, "is_connected", None)
+                if callable(is_connected):
+                    return bool(target.is_connected())
                 return True
             except Exception:
                 return False
@@ -334,19 +333,19 @@ async def run_login_session(
         while True:
             left = int(deadline - time.monotonic())
             if left <= 0:
-                print("等待超时，未修改原登录态文件。")
-                status_update(status="timeout", message="等待超时，未修改原登录态文件", timed_out=True)
+                print("等待超时，未修改原登录态文件。独立浏览器配置里的网站本地状态会保留。")
+                status_update(status="timeout", message="等待超时，未修改原登录态文件。独立浏览器配置里的网站本地状态会保留", timed_out=True)
                 exit_code = 3
                 break
             action = await (wait_action or wait_for_console_action)(left, is_browser_open=_browser_still_open)
             if action == "timeout":
-                print("等待超时，未修改原登录态文件。")
-                status_update(status="timeout", message="等待超时，未修改原登录态文件", timed_out=True)
+                print("等待超时，未修改原登录态文件。独立浏览器配置里的网站本地状态会保留。")
+                status_update(status="timeout", message="等待超时，未修改原登录态文件。独立浏览器配置里的网站本地状态会保留", timed_out=True)
                 exit_code = 3
                 break
             if action == "cancel":
-                print("已取消，未修改原登录态文件。")
-                status_update(status="cancelled", message="已取消，未修改原登录态文件", cancelled=True)
+                print("已取消，未修改原登录态文件。独立浏览器配置里的网站本地状态会保留，取消不能抹除这些变化。")
+                status_update(status="cancelled", message="已取消，未修改原登录态文件。独立浏览器配置里的网站本地状态会保留，取消不能抹除这些变化", cancelled=True)
                 exit_code = 4
                 break
 
@@ -373,18 +372,16 @@ async def run_login_session(
         status_update(status="error", message=message)
         exit_code = 1
     finally:
-        for closer in (context, browser):
-            if closer is None:
-                continue
-            try:
-                await closer.close()
-            except Exception:
-                pass
+        try:
+            await close_persistent_context(context)
+        except Exception:
+            pass
         if playwright is not None:
             try:
                 await playwright.stop()
             except Exception:
                 pass
+        profile_lock.release()
     return exit_code
 
 
