@@ -193,3 +193,30 @@ def test_delete_task_stops_runtime_and_reindexes_process_state(
     process_service = api_context["process_service"]
     assert process_service.stopped == [0]
     assert process_service.reindexed == []
+
+
+def test_start_stop_task_preserves_account_binding(api_client, api_context, sample_task_payload):
+    payload = {
+        **sample_task_payload,
+        "account_state_file": "state/acc_1.json",
+        "account_strategy": "fixed",
+    }
+    response = api_client.post("/api/tasks/", json=payload)
+    assert response.status_code == 200
+    created = response.json()["task"]
+    assert created["account_state_file"] == "state/acc_1.json"
+    assert created["account_strategy"] == "fixed"
+
+    response = api_client.post("/api/tasks/start/0")
+    assert response.status_code == 200
+    started = api_client.get("/api/tasks/0").json()
+    assert started["is_running"] is True
+    assert started["account_state_file"] == "state/acc_1.json"
+    assert started["account_strategy"] == "fixed"
+
+    response = api_client.post("/api/tasks/stop/0")
+    assert response.status_code == 200
+    stopped = api_client.get("/api/tasks/0").json()
+    assert stopped["is_running"] is False
+    assert stopped["account_state_file"] == "state/acc_1.json"
+    assert stopped["account_strategy"] == "fixed"

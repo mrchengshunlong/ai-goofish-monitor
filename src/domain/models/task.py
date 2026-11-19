@@ -64,15 +64,30 @@ def _extract_keywords_from_legacy_groups(groups) -> List[str]:
     return _normalize_keyword_values(merged)
 
 
-def _normalize_payload_keywords(payload: Any) -> Any:
+def _normalize_payload_keywords(payload: Any, *, partial: bool = False) -> Any:
     if payload is None or not isinstance(payload, dict):
         return payload
     values = dict(payload)
-    values["account_state_file"] = clean_account_state_file(values.get("account_state_file"))
-    values["account_strategy"] = normalize_account_strategy(
-        values.get("account_strategy"),
-        values.get("account_state_file"),
-    )
+    has_account_file = "account_state_file" in values
+    has_account_strategy = "account_strategy" in values
+    # Full create/load always normalizes account fields. Partial updates (TaskUpdate)
+    # only touch them when the caller actually sent an account key, so is_running
+    # flips do not reset bindings, while an explicit null still clears the account.
+    if not partial or has_account_file or has_account_strategy:
+        if not partial or has_account_file:
+            values["account_state_file"] = clean_account_state_file(
+                values.get("account_state_file")
+            )
+        if not partial or has_account_file or has_account_strategy:
+            file_for_strategy = (
+                values.get("account_state_file")
+                if (not partial or has_account_file)
+                else None
+            )
+            values["account_strategy"] = normalize_account_strategy(
+                values.get("account_strategy"),
+                file_for_strategy,
+            )
     if "keyword_rules" in values:
         values["keyword_rules"] = _normalize_keyword_values(values.get("keyword_rules"))
     elif "keyword_rule_groups" in values:
@@ -251,7 +266,7 @@ class TaskUpdate(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_keyword_payload(cls, values):
-        return _normalize_payload_keywords(values)
+        return _normalize_payload_keywords(values, partial=True)
 
     @field_validator("min_price", "max_price", mode="before")
     @classmethod
